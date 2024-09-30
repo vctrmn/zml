@@ -152,6 +152,13 @@ bazel run -c opt //llama:Llama-3.1-8B-Instruct
 bazel run -c opt //llama:Llama-3.1-8B-Instruct -- --prompt="Once upon a time,"
 ```
 
+```
+# requires token in $HOME/.cache/huggingface/token
+cd examples
+bazel run -c opt //llama:Llama-3.2-1B-Instruct
+bazel run -c opt //llama:Llama-3.2-1B-Instruct -- --prompt="Once upon a time,"
+```
+
 
 ## Running Models on GPU / TPU
 

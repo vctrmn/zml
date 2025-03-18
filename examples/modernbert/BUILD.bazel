@@ -12,6 +12,21 @@ zig_cc_binary(
     ],
 )
 
+zig_cc_binary(
+    name = "server",
+    srcs = [
+        "modernbert.zig",
+    ],
+    main = "server.zig",
+    deps = [
+        "@com_github_hejsil_clap//:clap",
+        "@com_github_zigzap_zap//:zap",
+        "@zml//async",
+        "@zml//stdx",
+        "@zml//zml",
+    ],
+)
+
 cc_binary(
     name = "ModernBERT-base",
     args = [
@@ -24,7 +39,7 @@ cc_binary(
         "@ModernBERT-base//:model.safetensors",
         "@ModernBERT-base//:tokenizer",
     ],
-    deps = [":modernbert_lib"],
+    deps = [":server_lib"],
 )
 
 cc_binary(

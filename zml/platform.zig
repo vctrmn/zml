@@ -1,16 +1,12 @@
-const asynk = @import("async");
-const builtin = @import("builtin");
-const runtimes = @import("runtimes");
 const std = @import("std");
+
+const runtimes = @import("runtimes");
+pub const Target = runtimes.Platform;
 const stdx = @import("stdx");
 
-const meta = @import("meta.zig");
-const module = @import("module.zig");
 const pjrt = @import("pjrtx.zig");
 
 const log = std.log.scoped(.zml);
-
-pub const Target = runtimes.Platform;
 
 pub const available_targets = std.enums.values(Target);
 
@@ -73,6 +69,17 @@ pub const Platform = struct {
         var res = self;
         res.compilation_options = opts;
         return res;
+    }
+
+    pub fn registerFFIType(self: Platform, comptime T: type) !void {
+        if (self.pjrt_api.ffi()) |ffi| {
+            if (!@hasDecl(T, "type_id")) {
+                stdx.debug.panic("registerFFIType requires type {s} to have a `type_id` i64 field ", .{@typeName(T)});
+            }
+            try ffi.registerTypeId(self.pjrt_api, T);
+        } else {
+            stdx.debug.panic("registerFFIType is not available for target {s}", .{@tagName(self.target)});
+        }
     }
 
     pub fn deinit(self: *Platform) void {

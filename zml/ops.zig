@@ -1,24 +1,16 @@
 const std = @import("std");
-const assert = std.debug.assert;
 
+const mlir = @import("mlir");
 const stdx = @import("stdx");
 
 const _collectAxes = @import("tensor.zig")._collectAxes;
-const buffer = @import("buffer.zig");
-const Buffer = buffer.Buffer;
-const Bufferized = @import("tensor.zig").Bufferized;
+const Buffer = @import("buffer.zig").Buffer;
+const CompilationContext = @import("module.zig").CompilationContext;
 const Context = @import("context.zig").Context;
-const Data = @import("dtype.zig").Data;
-const DataType = @import("dtype.zig").DataType;
-const helpers = @import("helpers.zig");
-const HostBuffer = @import("hostbuffer.zig").HostBuffer;
 const meta = @import("meta.zig");
-const mlir = @import("mlir.zig");
-const module = @import("module.zig");
-const CompilationContext = module.CompilationContext;
+const mlirx = @import("mlirx.zig");
 const Platform = @import("platform.zig").Platform;
 const Shape = @import("shape.zig").Shape;
-const ShapeOf = @import("tensor.zig").ShapeOf;
 const Tensor = @import("tensor.zig").Tensor;
 
 const EnumLiteral = @TypeOf(.enum_literal);
@@ -108,13 +100,15 @@ test "simple while" {
     const zml = @import("zml.zig");
     const platform = zml.testing.env();
 
-    const init_i = try zml.Buffer.fromSlice(platform, .{}, &[_]i64{0});
-    const init_sum = try zml.Buffer.fromSlice(platform, .{}, &[_]i64{0});
-    const counter: zml.Bufferized(CountInts) = .{
-        .step = try zml.Buffer.fromSlice(platform, .{}, &[_]i64{1}),
-        .end = try zml.Buffer.fromSlice(platform, .{}, &[_]i64{10}),
-    };
-    const res0, const res1 = try zml.testing.compileAndCall(platform, CountInts._fwd, .{ counter, init_i, init_sum });
+    const res0, const res1 = try zml.testing.compileAndCall(
+        platform,
+        CountInts._fwd,
+        .{
+            .{ .step = try .scalar(platform, 1, .i64), .end = try .scalar(platform, 10, .i64) },
+            try .scalar(platform, 0, .i64),
+            try .scalar(platform, 0, .i64),
+        },
+    );
     const last_i = try res0.getValue(i64);
     const sum = try res1.getValue(i64);
 
@@ -198,14 +192,14 @@ pub fn reduce(
                 mlir_ctx,
                 val,
                 inner_ctx.broadcasting_axes[0 .. tensor.rank() - inner_ctx.n_reduced],
-                mlir.ext.RankedTensorType.fromShape(mlir_ctx, reduced_shape).as(mlir.Type),
+                mlirx.tensorType(mlir_ctx, reduced_shape),
                 inner_ctx.loc,
             );
             tensor.* = Tensor._result(reduced_shape, broad_val.result(0));
             inner_ctx.index += 1;
         }
     }).cb, &local_context, &res);
-    assert(local_context.index == op.numResults());
+    std.debug.assert(local_context.index == op.numResults());
     return res;
 }
 
@@ -246,7 +240,8 @@ pub fn reduceWindow(
             .{ "window_strides", .dense(ctx.mlirCtx(), .i64, opts.window_strides) },
             .{ "base_dilations", .dense(ctx.mlirCtx(), .i64, opts.base_dilations) },
             .{ "window_dilations", .dense(ctx.mlirCtx(), .i64, opts.window_dilations) },
-            .{ "padding", .denseElements(ctx.mlirCtx(), &.{ @intCast(opts.padding.len), 2 }, .i64, opts.padding) },
+            // Cast the [][2]i64 to []i64 (safe)
+            .{ "padding", .denseElements(ctx.mlirCtx(), &.{ @intCast(opts.padding.len), 2 }, .i64, @ptrCast(opts.padding)) },
         },
         .location = loc,
     });
@@ -607,8 +602,8 @@ pub fn sort(
         .result_type_inference = true,
         .blocks = &.{block},
         .attributes = &.{
-            .{ "dimension", mlir.IntegerAttribute(.i64).init(ctx.mlirCtx(), dimension).as(mlir.Attribute) },
-            .{ "is_stable", mlir.BoolAttribute.init(ctx.mlirCtx(), is_stable).as(mlir.Attribute) },
+            .{ "dimension", .int(ctx.mlirCtx(), .i64, dimension) },
+            .{ "is_stable", .boolean(ctx.mlirCtx(), is_stable) },
         },
         .location = loc,
     });
@@ -765,7 +760,7 @@ pub fn fromMlirOperationWithTags(op: mlir.Operation, base: anytype) @TypeOf(base
             inner_ctx.index += 1;
         }
     }).cb, &context, &res);
-    assert(context.index == op.numResults());
+    std.debug.assert(context.index == op.numResults());
     return res;
 }
 
@@ -781,44 +776,19 @@ pub fn addHostCallback(
     output_shapes: []const Shape,
     opts: HostCallbackOpt,
 ) []Tensor {
-    const ctx = CompilationContext.current();
-
-    const mlir_ctx = ctx.mlirCtx();
-    const backend_config = mlir.Attribute.dict(mlir_ctx, &.{
-        .{ "callback", .int(mlir_ctx, .u64, @bitCast(@intFromPtr(callback))) },
-        .{ "user_context", .int(mlir_ctx, .u64, @bitCast(@intFromPtr(blkctx))) },
-    });
-
-    const values = stdx.stackSlice(8, mlir.Value, inputs.len);
-    for (inputs, values) |i, *v| {
-        v.* = ctx.getValue(i.toMemory(.host_pinned));
-    }
-    const res_types = stdx.stackSlice(8, mlir.Type, output_shapes.len);
-    for (res_types, output_shapes) |*r, o| {
-        r.* = mlir.ext.RankedTensorType.fromShape(mlir_ctx, o).as(mlir.Type);
-    }
-
-    const loc = ctx.mlirCtx().location(@src());
-    const op = dialect.stablehlo.custom_call(
-        ctx.mlirCtx(),
-        values,
+    return customCall(
+        "zmlHostBufferCallback",
+        inputs,
+        output_shapes,
         .{
-            .call_target_name = "zmlHostBufferCallback",
-            .api_version = .typed_ffi,
-            .backend_config = backend_config,
+            .callback = @intFromPtr(callback),
+            .user_context = @intFromPtr(blkctx),
+        },
+        .{
             .has_side_effect = opts.has_side_effect,
             .output_operand_aliases = opts.output_operand_aliases,
         },
-        res_types,
-        loc,
     );
-
-    const res = ctx.allocator().alloc(Tensor, output_shapes.len) catch @panic("OOM");
-    for (res, output_shapes, 0..) |*r, o, i| {
-        r.* = Tensor._result(o, op.result(i)).toMemory(.device);
-    }
-
-    return res;
 }
 
 pub const TritonOps = struct {
@@ -840,7 +810,7 @@ pub fn triton(inputs: anytype, outputs: anytype, opts: TritonOps) [outputs.len]T
 
     var res_types: [outputs.len]mlir.Type = undefined;
     inline for (outputs, 0..) |output, i| {
-        res_types[i] = mlir.ext.mlirType(ctx.mlirCtx(), output);
+        res_types[i] = mlirx.tensorType(ctx.mlirCtx(), output);
     }
 
     const backend_config = mlir.Attribute.dict(ctx.mlirCtx(), &.{
@@ -1054,7 +1024,7 @@ pub fn scatter(
             inner_ctx.index += 1;
         }
     }).cb, &local_context, &res);
-    assert(local_context.index == op.numResults());
+    std.debug.assert(local_context.index == op.numResults());
     return res;
 }
 
@@ -1244,6 +1214,169 @@ fn scatterPrepareIndices(
         }
     }
     return Tensor.stack(indices.constSlice(), .last, .coord);
+}
+
+fn TensorOrTensorArray(comptime T: type) type {
+    const type_info = @typeInfo(T);
+    return switch (type_info) {
+        .@"struct" => |struct_info| b: {
+            if (T == Tensor) break :b Tensor;
+            if (!struct_info.is_tuple) @compileError("Expected tuple");
+            break :b if (struct_info.fields.len == 1)
+                Tensor
+            else
+                [struct_info.fields.len]Tensor;
+        },
+        .array => |array_info| b: {
+            break :b if (array_info.len == 1)
+                Tensor
+            else
+                [array_info.len]Tensor;
+        },
+        .pointer => |pointer_info| b: {
+            if (pointer_info.size != .slice) @compileError("Expected slice");
+            break :b []Tensor;
+        },
+        else => @compileError("Unsupported type: " ++ @typeName(T)),
+    };
+}
+
+pub const CustomCallOptions = struct {
+    has_side_effect: bool,
+    output_operand_aliases: ?[]const i64 = null,
+};
+
+pub fn customCall(target_name: [:0]const u8, inputs: anytype, outputs: anytype, metadata: anytype, opts: CustomCallOptions) TensorOrTensorArray(@TypeOf(outputs)) {
+    // Transform generic inputs to flat slice.
+    const inputs_: []const Tensor = switch (@typeInfo(@TypeOf(inputs))) {
+        .@"struct" => |struct_info| b: {
+            if (@TypeOf(inputs) == Tensor) {
+                break :b &[1]Tensor{inputs};
+            }
+            if (!struct_info.is_tuple) @compileError("Expected tuple");
+            var inputs_: [struct_info.fields.len]Tensor = undefined;
+            meta.collectBuf((struct {
+                pub fn func(t: Tensor) Tensor {
+                    return t;
+                }
+            }).func, {}, &inputs, &inputs_);
+            break :b &inputs_;
+        },
+        .array => &inputs,
+        .pointer => |pointer_info| b: {
+            if (pointer_info.size != .slice) @compileError("Expected slice");
+            break :b inputs;
+        },
+        else => @compileError("Unsupported type: " ++ @typeName(@TypeOf(inputs))),
+    };
+
+    // Transform generic outputs to flat slice.
+    const output_shapes: []const Shape = switch (@typeInfo(@TypeOf(outputs))) {
+        .@"struct" => |struct_info| b: {
+            if (@TypeOf(outputs) == Shape) {
+                break :b &[1]Shape{outputs};
+            }
+            if (!struct_info.is_tuple) @compileError("Expected tuple");
+            var output_shapes: [struct_info.fields.len]Shape = undefined;
+            meta.collectBuf((struct {
+                pub fn func(t: Shape) Shape {
+                    return t;
+                }
+            }).func, {}, &outputs, &output_shapes);
+            break :b &output_shapes;
+        },
+        .array => &outputs,
+        .pointer => |pointer_info| b: {
+            if (pointer_info.size != .slice) @compileError("Expected slice");
+            break :b outputs;
+        },
+        else => @compileError("Unsupported type: " ++ @typeName(@TypeOf(outputs))),
+    };
+
+    const outputs_flat = customCallInternal(target_name, inputs_, output_shapes, metadata, opts);
+
+    // Transform flat slice to generic outputs.
+    return switch (@typeInfo(@TypeOf(outputs))) {
+        .@"struct" => |struct_info| b: {
+            if (@TypeOf(outputs) == Shape) break :b outputs_flat[0];
+            if (!struct_info.is_tuple) @compileError("Expected tuple");
+            if (struct_info.fields.len == 1) break :b outputs_flat[0];
+            var outputs_: [struct_info.fields.len]Tensor = undefined;
+            @memcpy(&outputs_, outputs_flat);
+            break :b outputs_;
+        },
+        .array => |array_info| b: {
+            if (array_info.len == 1) break :b outputs_flat[0];
+            var outputs_: [array_info.fields.len]Tensor = undefined;
+            @memcpy(&outputs_, outputs_flat);
+            break :b outputs_;
+        },
+        .pointer => |pointer_info| b: {
+            if (pointer_info.size != .slice) @compileError("Expected slice");
+            break :b outputs_flat;
+        },
+        else => @compileError("Unsupported type: " ++ @typeName(@TypeOf(outputs))),
+    };
+}
+
+fn customCallInternal(target_name: [:0]const u8, inputs: []const Tensor, outputs: []const Shape, metadata: anytype, opts: CustomCallOptions) []Tensor {
+    const ctx = CompilationContext.current();
+
+    const values = ctx.allocator().alloc(mlir.Value, inputs.len) catch unreachable;
+    ctx.extractValues(inputs, values);
+
+    const res_types = ctx.allocator().alloc(mlir.Type, outputs.len) catch unreachable;
+    for (outputs, 0..) |output, i| {
+        res_types[i] = mlirx.tensorType(ctx.mlirCtx(), output);
+    }
+
+    const metadata_type_info = @typeInfo(@TypeOf(metadata));
+    var metadata_attributes_tuple: [metadata_type_info.@"struct".fields.len]mlir.AttrTuple = undefined;
+    inline for (metadata_type_info.@"struct".fields, 0..) |field, i| {
+        const attribute: mlir.Attribute = switch (@typeInfo(field.type)) {
+            .int, .comptime_int => .int(ctx.mlirCtx(), .u64, @bitCast(@field(metadata, field.name))),
+            else => @compileError("Unsupported metadata type: " ++ @typeName(field.type)),
+        };
+        metadata_attributes_tuple[i] = .{ field.name, attribute };
+    }
+
+    const backend_config = mlir.Attribute.dict(ctx.mlirCtx(), &(metadata_attributes_tuple ++ [_]mlir.AttrTuple{
+        .{ "pjrt_api", .int(ctx.mlirCtx(), .u64, @bitCast(@intFromPtr(ctx._platform.pjrt_api))) },
+        .{ "pjrt_client", .int(ctx.mlirCtx(), .u64, @bitCast(@intFromPtr(ctx._platform.pjrt_client))) },
+    }));
+
+    const operands_layouts = ctx.allocator().alloc([]const usize, inputs.len) catch unreachable;
+    for (inputs, 0..) |input, i| {
+        operands_layouts[i] = minorToMajor(input.rank());
+    }
+
+    const results_layouts = ctx.allocator().alloc([]const usize, outputs.len) catch unreachable;
+    for (outputs, 0..) |output, i| {
+        results_layouts[i] = minorToMajor(output.rank());
+    }
+
+    const op = dialect.stablehlo.custom_call(
+        ctx.mlirCtx(),
+        values,
+        .{
+            .call_target_name = target_name,
+            .backend_config = backend_config,
+            .has_side_effect = opts.has_side_effect,
+            .api_version = .typed_ffi,
+            .operand_layouts = operands_layouts,
+            .result_layouts = results_layouts,
+            .output_operand_aliases = opts.output_operand_aliases orelse &.{},
+        },
+        res_types,
+        ctx.mlirCtx().location(@src()),
+    );
+
+    const outputs_ = ctx.allocator().alloc(Tensor, outputs.len) catch unreachable;
+    for (outputs, 0..) |output, i| {
+        outputs_[i] = Tensor._result(output, op.result(i));
+    }
+
+    return outputs_;
 }
 
 inline fn toI64(values: anytype) []i64 {

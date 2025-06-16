@@ -2,21 +2,18 @@ const std = @import("std");
 
 const asynk = @import("async");
 const dialect = @import("mlir/dialects");
-const runfiles = @import("runfiles");
+const mlir = @import("mlir");
 const stdx = @import("stdx");
 const xla_pb = @import("//xla:xla_proto");
 
 const BaseExe = @import("exe.zig").BaseExe;
 const Buffer = @import("buffer.zig").Buffer;
-const Bufferized = @import("tensor.zig").Bufferized;
 const meta = @import("meta.zig");
-const mlir = @import("mlir.zig");
-const Location = mlir.Location;
+const mlirx = @import("mlirx.zig");
 const ops = @import("ops.zig");
 const pjrt = @import("pjrtx.zig");
 const Platform = @import("platform.zig").Platform;
 const Shape = @import("shape.zig").Shape;
-const ShapeOf = @import("tensor.zig").ShapeOf;
 const Target = @import("platform.zig").Target;
 const Tensor = @import("tensor.zig").Tensor;
 const Tracer = @import("tools/tracer.zig").Tracer;
@@ -29,7 +26,7 @@ test {
 
 pub const MlirFn = struct {
     name: []const u8,
-    num_args: u32,
+    args_shapes: []Shape,
     res_tensors: *const anyopaque,
     res_types: []mlir.Type,
     res_shapes: []Shape,
@@ -170,8 +167,8 @@ pub const CompilationContext = struct {
 
         const sharding = self._platform.sharding();
         const mlir_ctx = self._mlir_ctx;
-        module.op().setAttributeByName("mhlo.num_replicas", mlir.IntegerAttribute(.i32).init(mlir_ctx, sharding.num_replicas).asAttr());
-        module.op().setAttributeByName("mhlo.num_partitions", mlir.IntegerAttribute(.i32).init(mlir_ctx, sharding.num_partitions).asAttr());
+        module.op().setAttributeByName("mhlo.num_replicas", .int(mlir_ctx, .i32, sharding.num_replicas));
+        module.op().setAttributeByName("mhlo.num_partitions", .int(mlir_ctx, .i32, sharding.num_partitions));
 
         const module_hash = computeModuleHash(self._platform, module);
         var module_dir: ?[]const u8 = null;
@@ -199,7 +196,7 @@ pub const CompilationContext = struct {
         const loaded_executable: *pjrt.LoadedExecutable = blk: {
             if (pjrt_location) |pjrt_loc| {
                 if (loadPjrtExecutable(arena, self._platform, pjrt_loc)) |exe| {
-                    log.info("Loaded pre-compiled module from {s}", .{pjrt_loc});
+                    log.info("Loaded pre-compiled module from {s} (generated from {s}/module.mlir)", .{ pjrt_loc, module_dir.? });
                     break :blk exe;
                 } else |err| {
                     if (err != error.FileNotFound) log.warn("Failed to load pre-compiled module: {} at {s}", .{ err, pjrt_loc });
@@ -233,7 +230,7 @@ pub const CompilationContext = struct {
             self._platform,
             loaded_executable,
             .{
-                .n_in = f.num_args,
+                .input_shapes = f.args_shapes,
                 .result_shapes = f.res_shapes,
                 .n_devices = sharding.num_replicas * sharding.num_partitions,
             },
@@ -341,12 +338,12 @@ pub const CompilationContext = struct {
         const locations = try arena.alloc(mlir.Location, tensor_count);
         @memset(locations, mlir.Location.unknown(mlir_ctx));
 
-        var input_shapes = try std.ArrayList(Shape).initCapacity(arena, tensor_count);
+        var input_shapes = try std.ArrayList(Shape).initCapacity(res_allocator, tensor_count);
         meta.collect(Tensor.shape, {}, &input_shapes, args) catch unreachable;
         stdx.debug.internalAssert(input_shapes.items.len == tensor_count, "args have changed ?", .{});
 
         const input_types = try arena.alloc(mlir.Type, tensor_count);
-        for (input_types, input_shapes.items) |*t, sh| t.* = mlir.ext.mlirType(mlir_ctx, sh);
+        for (input_types, input_shapes.items) |*t, sh| t.* = mlirx.tensorType(mlir_ctx, sh);
 
         const og_block_args = self._block_args;
         defer {
@@ -427,7 +424,7 @@ pub const CompilationContext = struct {
         return .{
             .mlir_fn = mlir_fn,
             .name = opts.name,
-            .num_args = @intCast(tensor_count),
+            .args_shapes = input_shapes.items,
             .res_tensors = fn_res,
             .res_types = fn_res_types,
             .res_shapes = fn_res_shapes,
@@ -512,7 +509,7 @@ pub const CompilationContext = struct {
 
         // Check that the `x` input argument gives its buffer to the result tensor.
         // `%arg0` is the bias of the model, `%arg1` is `x`, `%arg2` is `y`.
-        try std.testing.expectEqual(3, f.num_args);
+        try std.testing.expectEqual(3, f.args_shapes.len);
         // We should have two buffers being donated.
         const template = "tf.aliasing_output = {d} : i32";
         var buf = template.*;
@@ -540,9 +537,13 @@ pub const CompilationContext = struct {
         }
     }
 
+    pub fn numPartitions(self: CompilationContext) u8 {
+        return self._platform.sharding().num_partitions;
+    }
+
     pub fn getShardingAttr(self: CompilationContext, shape: Shape) mlir.Attribute {
         const ctx = self.mlirCtx();
-        const num_partitions = self._platform.sharding().num_partitions;
+        const num_partitions = self.numPartitions();
         var sharding_str: std.BoundedArray(u8, 128) = .{};
         writeShardingRepresentation(shape, num_partitions, sharding_str.writer()) catch unreachable;
         return mlir.Attribute.string(ctx, sharding_str.constSlice());
@@ -645,10 +646,11 @@ pub const CompilationContext = struct {
 
         const loc = self.mlirCtx().location(@src());
 
-        const values = try arena.alloc(mlir.Value, function.num_args);
+        const num_args = function.args_shapes.len;
+        const values = try arena.alloc(mlir.Value, num_args);
         self.extractValues(&args, values);
 
-        const donations = try arena.alloc(Tensor._Donation, function.num_args);
+        const donations = try arena.alloc(Tensor._Donation, num_args);
         meta.collectBuf(struct {
             pub fn cb(ctx: *const CompilationContext, x: Tensor) Tensor._Donation {
                 return ctx.getValueAndDonation(x)[1];
@@ -942,7 +944,7 @@ pub fn fillMlirTypes(v: anytype, mlir_ctx: mlir.Context, types: []mlir.Type) voi
     var context = LocalContext{ .mlir_ctx = mlir_ctx, .types = types };
     meta.visit((struct {
         fn cb(inner_context: *LocalContext, tensor: *const Tensor) void {
-            inner_context.types[inner_context.index] = mlir.ext.mlirType(inner_context.mlir_ctx, tensor.shape());
+            inner_context.types[inner_context.index] = mlirx.tensorType(inner_context.mlir_ctx, tensor.shape());
             inner_context.index += 1;
         }
     }).cb, &context, v);
@@ -1006,21 +1008,21 @@ test FnCache {
         }
     };
 
-    const x = try zml.Buffer.fromSlice(platform, .{2}, &[_]f16{ -1, 1 });
-    const nn: zml.Bufferized(NN) = .{
+    const x = try zml.Buffer.fromArray(platform, [2]f16{ -1, 1 });
+    const nn: zml.testing.BufferizedWithArgs(NN) = .{
         .layers = .{
             .{
-                .w = try zml.Buffer.fromSlice(platform, .{ 2, 2 }, &[_]f16{ 1, -1, 0, 1 }),
-                .b = try zml.Buffer.fromSlice(platform, .{2}, &[_]f16{ 0, 0 }),
+                .w = try .fromArray(platform, [2][2]f16{ .{ 1, -1 }, .{ 0, 1 } }),
+                .b = try .fromArray(platform, [2]f16{ 0, 0 }),
             },
             .{
-                .w = try zml.Buffer.fromSlice(platform, .{ 2, 2 }, &[_]f16{ 1, 2, 1, -1 }),
-                .b = try zml.Buffer.fromSlice(platform, .{2}, &[_]f16{ 10, 10 }),
+                .w = try .fromArray(platform, [2][2]f16{ .{ 1, 2 }, .{ 1, -1 } }),
+                .b = try .fromArray(platform, [2]f16{ 10, 10 }),
             },
             // third layer is different
             .{
-                .w = try zml.Buffer.fromSlice(platform, .{ 3, 2 }, &[_]f16{ 1, 2, 0, 1, -1, 0 }),
-                .b = try zml.Buffer.fromSlice(platform, .{3}, &[_]f16{ -10, -10, -10 }),
+                .w = try .fromArray(platform, [3][2]f16{ .{ 1, 2 }, .{ 0, 1 }, .{ -1, 0 } }),
+                .b = try .fromArray(platform, [3]f16{ -10, -10, -10 }),
             },
         },
     };
@@ -1079,13 +1081,13 @@ test "FnCache with mixed integer/tensor" {
         }
     };
 
-    const x = try zml.Buffer.fromSlice(platform, .{2}, &[_]f16{ -1, 1 });
-    const nn: zml.Bufferized(NN) = .{
+    const x = try zml.Buffer.fromArray(platform, [2]f16{ -1, 1 });
+    const nn: zml.testing.BufferizedWithArgs(NN) = .{
         .layers = .{
-            .{ .w = try zml.Buffer.fromSlice(platform, .{ 2, 2 }, &[_]f16{ 1, -1, 0, 1 }) },
-            .{ .w = try zml.Buffer.fromSlice(platform, .{ 2, 2 }, &[_]f16{ 1, 2, 1, -1 }) },
+            .{ .w = try .fromArray(platform, [2][2]f16{ .{ 1, -1 }, .{ 0, 1 } }) },
+            .{ .w = try .fromArray(platform, [2][2]f16{ .{ 1, 2 }, .{ 1, -1 } }) },
             // third layer has different shape
-            .{ .w = try zml.Buffer.fromSlice(platform, .{ 3, 2 }, &[_]f16{ 1, 2, 0, 1, -1, 0 }) },
+            .{ .w = try .fromArray(platform, [3][2]f16{ .{ 1, 2 }, .{ 0, 1 }, .{ -1, 0 } }) },
         },
     };
     const res = try zml.testing.compileAndCall(platform, NN._fwd, .{ nn, x });

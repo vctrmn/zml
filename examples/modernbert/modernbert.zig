@@ -1,11 +1,11 @@
 const std = @import("std");
-const log = std.log.scoped(.modernbert);
 
 const asynk = @import("async");
 const stdx = @import("stdx");
 const zml = @import("zml");
-
 const Tensor = zml.Tensor;
+
+const log = std.log.scoped(.modernbert);
 
 pub const ModernBertOptions = struct {
     num_attention_heads: i64,
@@ -56,6 +56,7 @@ pub const ModernBertModel = struct {
     pub fn init(self: *ModernBertModel, options: ModernBertOptions) void {
         self.options = options;
         self.final_norm.eps = 1e-5;
+        self.embeddings.norm.eps = 1e-5;
         for (self.layers, 0..) |*encoder_layer, layer_idx| {
             encoder_layer.attn.Wqkv.weight = encoder_layer.attn.Wqkv.weight.withSharding(.{0});
             encoder_layer.attn.Wo.weight = encoder_layer.attn.Wo.weight.withSharding(.{1});
@@ -103,7 +104,7 @@ pub const ModernBertModel = struct {
         // Broadcast to the desired output shape.
         const seq_len = ids.dim(.k);
         const pad_mask_shape = zml.Shape.init(.{ .b = pad_mask.dim(.b), .q = seq_len, .k = seq_len }, dt);
-        return pad_mask.broad(pad_mask_shape).print();
+        return pad_mask.broad(pad_mask_shape);
     }
 
     /// Restrict global attn mask to a sliding window.
@@ -120,7 +121,7 @@ pub const ModernBertModel = struct {
         // Create sliding window mask (1 for positions within window, 0 outside)
         const window_mask = distance.cmp(.LE, Tensor.scalar(@divExact(window_size, 2), .i32));
         const minus_inf = Tensor.constant(mask_shape, mask_shape.dtype().minValue());
-        return window_mask.select(global_mask, minus_inf).print();
+        return window_mask.select(global_mask, minus_inf);
     }
 };
 
@@ -222,7 +223,7 @@ pub const ModernBertAttention = struct {
         // Layer 0, 3, 6, 9, 12 ... use global RoPE
         // Layer 1, 2, 4, 5, 7, 8, 10, 11 ... use local RoPE
         const rope_opts = zml.nn.RopeOpts{
-            .impl = .sequential,
+            .layout = .sequential,
             .freq_base = if (self.is_global_attention) 160_000 else 10_000,
         };
 

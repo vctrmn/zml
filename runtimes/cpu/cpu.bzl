@@ -25,22 +25,22 @@ def _cpu_pjrt_plugin_impl(mctx):
     http_archive(
         name = "libpjrt_cpu_linux_amd64",
         build_file_content = _BUILD_FILE_DEFAULT_VISIBILITY + _BUILD_LINUX,
-        sha256 = "1cda1325095c12bd0019838d28ee92d811ac478d22ed3c08020d5a0cd2d9f34a",
-        url = "https://github.com/zml/pjrt-artifacts/releases/download/v7.0.0/pjrt-cpu_linux-amd64.tar.gz",
+        sha256 = "4106ca11ab41bc9ec000d536ae084442139b5639ca329bfb62c7e0742acdc47a",
+        url = "https://github.com/zml/pjrt-artifacts/releases/download/v10.0.0/pjrt-cpu_linux-amd64.tar.gz",
     )
 
     http_archive(
         name = "libpjrt_cpu_darwin_amd64",
         build_file_content = _BUILD_FILE_DEFAULT_VISIBILITY + _BUILD_DARWIN,
-        sha256 = "35af82d9e5c70d16ac15f4c18024a2dd5ed2faefc89940eafe3d5350d2cbd9e7",
-        url = "https://github.com/zml/pjrt-artifacts/releases/download/v7.0.0/pjrt-cpu_darwin-amd64.tar.gz",
+        sha256 = "7be4d98f0737601fba7b29563917054aac3d09365139e6d3f5f96023a8c71c87",
+        url = "https://github.com/zml/pjrt-artifacts/releases/download/v10.0.0/pjrt-cpu_darwin-amd64.tar.gz",
     )
 
     http_archive(
         name = "libpjrt_cpu_darwin_arm64",
         build_file_content = _BUILD_FILE_DEFAULT_VISIBILITY + _BUILD_DARWIN,
-        sha256 = "da4deaf850d715997614768b2fc0283595ee8181133ab3243d65635e3439de69",
-        url = "https://github.com/zml/pjrt-artifacts/releases/download/v7.0.0/pjrt-cpu_darwin-arm64.tar.gz",
+        sha256 = "442cccd98d7adf4afe0f818ebba265baca6b68dea95b10ef2b4d4229b81d5412",
+        url = "https://github.com/zml/pjrt-artifacts/releases/download/v10.0.0/pjrt-cpu_darwin-arm64.tar.gz",
     )
 
     return mctx.extension_metadata(

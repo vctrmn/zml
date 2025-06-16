@@ -1,11 +1,8 @@
-const asynk = @import("async");
-const builtin = @import("builtin");
-const c = @import("c");
 const std = @import("std");
-const stdx = @import("stdx");
 
-const zml = @import("zml.zig");
-const posix = @import("posix.zig");
+const asynk = @import("async");
+const c = @import("c");
+const stdx = @import("stdx");
 
 pub const gguf = @import("aio/gguf.zig");
 pub const nemo = @import("aio/nemo.zig");
@@ -13,10 +10,11 @@ pub const safetensors = @import("aio/safetensors.zig");
 pub const tinyllama = @import("aio/tinyllama.zig");
 pub const torch = @import("aio/torch.zig");
 pub const yaml = @import("aio/yaml.zig");
+const HostBuffer = @import("hostbuffer.zig").HostBuffer;
+const posix = @import("posix.zig");
+const zml = @import("zml.zig");
 
 pub const log = std.log.scoped(.@"zml/aio");
-const HostBuffer = @import("hostbuffer.zig").HostBuffer;
-
 test {
     std.testing.refAllDecls(@This());
     std.testing.refAllDecls(gguf);
@@ -25,6 +23,8 @@ test {
     std.testing.refAllDecls(torch);
     std.testing.refAllDecls(yaml);
 }
+
+// TODO error set for weight loading
 
 /// Detects the format of the model file (base on filename) and open it.
 pub fn detectFormatAndOpen(allocator: std.mem.Allocator, model_path: []const u8) !BufferStore {
@@ -422,7 +422,7 @@ fn _populateStruct(
             return true;
         },
         .float => {
-            obj.* = undefined;
+            obj.* = std.math.nan(@TypeOf(obj.*));
             return true;
         },
         .void => true,
@@ -450,7 +450,7 @@ test populateModel {
 
         // Create a fake HostBuffer, we use the given integer to identify the created buffer.
         fn _newHostBuffer(n: u32) zml.HostBuffer {
-            return .{ ._shape = zml.Shape.init(.{n}, .f16), .data = undefined };
+            return .{ ._shape = zml.Shape.init(.{n}, .f16), ._strides = undefined, ._data = undefined };
         }
     };
 
@@ -500,7 +500,7 @@ test populateModel {
 /// The `init_args` are used to initialize the non Buffer fields, using `Model.init` function.
 pub fn loadBuffers(
     comptime Model: type,
-    init_args: anytype,
+    init_args: if (@hasDecl(Model, "init")) stdx.meta.Tail(stdx.meta.FnArgs(Model.init)) else void,
     buffer_store: BufferStore,
     allocator: std.mem.Allocator,
     platform: zml.Platform,
@@ -534,8 +534,6 @@ pub fn loadBuffersWithPrefix(
     // If the Model has a "init" function, call it with the given parameters.
     if (@hasDecl(Model, "init")) {
         @call(.auto, Model.init, .{&model} ++ init_args);
-    } else {
-        stdx.debug.assertComptime(@TypeOf(init_args) == void or @TypeOf(init_args) == @TypeOf(.{}), "Model of type {} has no init function, so `loadBuffers` should be call with init_args set to {{}} (void)", .{Model});
     }
 
     return loadModelBuffersWithPrefix(Model, model, buffer_store, allocator, platform, prefix);
@@ -653,8 +651,11 @@ fn findSimilarBufferKeys(original_key: []const u8, store: BufferStore, temp_allo
 
 /// deinit all buffers in the given struct
 pub fn awaitAll(buffers: anytype) !void {
-    // TODO: implement once we have async buffers.
-    _ = buffers;
+    zml.meta.visit((struct {
+        fn cb(_: void, buffer: *zml.Buffer) void {
+            buffer.* = buffer.awaitt() catch unreachable;
+        }
+    }).cb, {}, buffers);
 }
 
 fn visitStructAndLoadBuffer(allocator: std.mem.Allocator, prefix_builder: *PrefixBuilder, buffer_store: BufferStore, obj: anytype, platform: zml.Platform) !void {
@@ -675,7 +676,7 @@ fn visitStructAndLoadBuffer(allocator: std.mem.Allocator, prefix_builder: *Prefi
             log.debug("Loading buffer {s} ({})", .{ prefix, obj._shape });
             stdx.debug.assert(host_buffer.shape().eql(obj._shape), "loadModelBuffers expects to find the same shapes in the model and in the buffer store, got {} and {} for tensor {s}", .{ obj._shape, host_buffer, prefix });
             buf_with_metadata._shape = obj._shape;
-            obj.* = try zml.Buffer.from(platform, buf_with_metadata);
+            obj.* = try zml.Buffer.from(platform, buf_with_metadata, .{});
         } else {
             log.err("Buffer not found: {s}", .{prefix});
 
